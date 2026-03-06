@@ -1,0 +1,166 @@
+# Training Configuration untuk DeepFusion on RTX 4080
+## PC Spek Monster - Training akan jauh lebih cepat!
+
+# ============================================
+# MODEL CONFIGURATION
+# ============================================
+
+model:
+  # LiDAR backbone
+  voxel_size: [0.16, 0.16, 4.0]
+  point_range: [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
+  max_points_per_pillar: 100
+  max_pillars: 12000
+
+  # Image encoder
+  image_backbone: resnet34
+  pretrained: true
+  image_features: 256
+
+  # Learnable alignment
+  hidden_dim: 256
+  n_heads: 8
+  n_layers: 1
+
+  # Detection
+  num_classes: 3  # Car, Pedestrian, Cyclist
+  max_objects_per_image: 512
+
+# ============================================
+# TRAINING CONFIGURATION (RTX 4080 Optimized)
+# ============================================
+
+training:
+  batch_size: 8         # Bisa lebih besar di RTX 4080!
+  epochs: 80            # Sama
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Learning rate schedule
+  scheduler: cosine
+  warmup_epochs: 5
+  min_lr: 0.00001
+
+  # Single-task loss (detection only)
+  lambda_detection: 1.0
+
+  # Early stopping
+  patience: 15
+  min_delta: 0.001
+
+# ============================================
+# DATA CONFIGURATION
+# ============================================
+
+data:
+  # KITTI dataset
+  root_path: /media/mf/AUTODRIVING-4TB/Downloads/Datasets/KITTI
+  train_split: train
+  val_split: val
+  test_split: test
+
+  # Data augmentation
+  augmentation: true
+
+  # Point cloud augmentation
+  point_aug_range: 0.2
+  point_noise_std: 0.01
+
+  # Image augmentation (full di RTX 4080)
+  img_flip: 0.5
+  img_rotate: 0.5
+  img_brightness: 0.3
+  img_contrast: 0.2
+
+# ============================================
+# LOSS CONFIGURATION
+# ============================================
+
+loss:
+  # Detection losses
+  heatmap:
+    type: focal
+    alpha: 0.25
+    beta: 2.0
+    gamma: 2.0
+
+  offset:
+    type: l1
+    weight: 1.0
+
+  size:
+    type: l1
+    weight: 1.0
+
+  rotation:
+    type: smooth_l1
+    beta: 0.1
+    weight: 1.0
+
+# ============================================
+# EVALUATION CONFIGURATION
+# ============================================
+
+evaluation:
+  iou_thresholds: [0.5, 0.7]
+  difficulty_levels: [easy, moderate, hard]
+  vis_threshold: 0.3
+  save_predictions: true
+
+  detection_metrics:
+    - ap
+    - precision
+    - recall
+    - f1
+
+# ============================================
+# SYSTEM CONFIGURATION (RTX 4080)
+# ============================================
+
+system:
+  # CUDA settings
+  device: cuda                 # GPU NVIDIA!
+  num_workers: 12             # Lebih banyak (16-core CPU)
+  pin_memory: true            # Untuk transfer GPU lebih cepat
+  cudnn_benchmark: true       # Optimasi performa
+
+  # Mixed precision (FP16 untuk speedup)
+  use_amp: true               # RTX 4080 support FP16 sangat baik
+
+  # Distributed training (opsional, kalau mau lebih cepat lagi)
+  distributed: false
+  world_size: 1
+
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
+
+logging:
+  log_dir: ./results/logs
+  checkpoint_dir: ./results/checkpoints
+
+  # Save checkpoints
+  save_freq: 5              # Save setiap 5 epochs
+
+  # TensorBoard
+  tensorboard: true
+  log_freq: 100
+
+  # Print to console
+  print_freq: 10
+
+# ============================================
+# EXPERIMENT CONFIGURATION
+# ============================================
+
+experiment:
+  name: deepfusion_detection_rtx4080
+  description: "DeepFusion Object Detection on RTX 4080"
+
+  tags:
+    - lidar_camera_fusion
+    - object_detection
+    - kitti
+    - rtx4080
+
+  notes: "Training on RTX 4080 - fast iteration for development"

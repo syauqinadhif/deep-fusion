@@ -1,0 +1,162 @@
+# Training Configuration untuk DeepFusion on MacBook Pro M4 Pro
+## Optimized for Apple Silicon (MPS) Training
+
+# ============================================
+# MODEL CONFIGURATION
+# ============================================
+
+model:
+  # LiDAR backbone
+  voxel_size: [0.16, 0.16, 4.0]
+  point_range: [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
+  max_points_per_pillar: 100
+  max_pillars: 12000
+
+  # Image encoder
+  image_backbone: resnet34
+  pretrained: true
+  image_features: 256
+
+  # Learnable alignment
+  hidden_dim: 256
+  n_heads: 8
+  n_layers: 1
+
+  # Detection
+  num_classes: 3  # Car, Pedestrian, Cyclist
+  max_objects_per_image: 512
+
+# ============================================
+# TRAINING CONFIGURATION (M4 Pro Optimized)
+# ============================================
+
+training:
+  batch_size: 2  # Reduced for M4 Pro memory constraints
+  epochs: 80     # Reduced from 100 for faster iteration
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Learning rate schedule
+  scheduler: cosine
+  warmup_epochs: 3
+  min_lr: 0.00001
+
+  # Single-task loss (detection only)
+  lambda_detection: 1.0
+
+  # Early stopping (increased patience for slower training)
+  patience: 20
+  min_delta: 0.001
+
+# ============================================
+# DATA CONFIGURATION
+# ============================================
+
+data:
+  # KITTI dataset
+  root_path: ~/Datasets/KITTI  # Update this path
+  train_split: train
+  val_split: val
+  test_split: test
+
+  # Data augmentation
+  augmentation: true
+
+  # Point cloud augmentation
+  point_aug_range: 0.2
+  point_noise_std: 0.01
+
+  # Image augmentation (reduced for M4 Pro)
+  img_flip: 0.5
+  img_rotate: 0.3  # Reduced from 0.5
+  img_brightness: 0.2
+  img_contrast: 0.15
+
+# ============================================
+# LOSS CONFIGURATION
+# ============================================
+
+loss:
+  # Detection losses
+  heatmap:
+    type: focal
+    alpha: 0.25
+    beta: 2.0
+    gamma: 2.0
+
+  offset:
+    type: l1
+    weight: 1.0
+
+  size:
+    type: l1
+    weight: 1.0
+
+  rotation:
+    type: smooth_l1
+    beta: 0.1
+    weight: 1.0
+
+# ============================================
+# EVALUATION CONFIGURATION
+# ============================================
+
+evaluation:
+  iou_thresholds: [0.5, 0.7]
+  difficulty_levels: [easy, moderate, hard]
+  vis_threshold: 0.3
+  save_predictions: true
+
+  detection_metrics:
+    - ap
+    - precision
+    - recall
+    - f1
+
+# ============================================
+# MACBOOK PRO M4 PRO SPECIFIC
+# ============================================
+
+system:
+  # MPS (Metal Performance Shaders) settings
+  device: mps  # Use Apple Silicon GPU
+  num_workers: 4  # M4 Pro has good multi-core performance
+  pin_memory: false  # Not needed for MPS
+  cudnn_benchmark: false  # Not applicable for MPS
+
+  # Mixed precision (not fully supported on MPS yet)
+  use_amp: false
+
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
+
+logging:
+  log_dir: ./results/logs
+  checkpoint_dir: ./results/checkpoints
+
+  # Save checkpoints
+  save_freq: 10  # Save every 10 epochs
+
+  # TensorBoard
+  tensorboard: false  # Use simpler logging on M4 Pro
+  log_freq: 50
+
+  # Print to console
+  print_freq: 5
+
+# ============================================
+# EXPERIMENT CONFIGURATION
+# ============================================
+
+experiment:
+  name: deepfusion_detection_m4pro
+  description: "DeepFusion Object Detection trained on MacBook Pro M4 Pro"
+
+  tags:
+    - lidar_camera_fusion
+    - object_detection
+    - kitti
+    - apple_silicon
+
+  notes: "Training on M4 Pro with MPS backend for Jetson deployment"

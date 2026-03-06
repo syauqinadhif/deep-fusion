@@ -1,0 +1,199 @@
+# Training Configuration untuk DeepFusion (Object Detection Only)
+## Skripsi S1 - Autonomous Driving - Jetson AGX Orin Deployment
+
+# ============================================
+# MODEL CONFIGURATION
+# ============================================
+
+model:
+  # LiDAR backbone (PointPillars)
+  voxel_size: [0.16, 0.16, 4.0]
+  point_range: [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
+  max_points_per_pillar: 100
+  max_pillars: 12000
+
+  # Image encoder
+  image_backbone: resnet34
+  pretrained: true
+  image_features: 256
+
+  # Learnable alignment
+  hidden_dim: 256
+  n_heads: 8
+  n_layers: 1
+
+  # Detection
+  num_classes: 3  # Car, Pedestrian, Cyclist
+  max_objects_per_image: 512
+
+# ============================================
+# TRAINING CONFIGURATION
+# ============================================
+
+training:
+  batch_size: 4
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Learning rate schedule
+  scheduler: cosine
+  warmup_epochs: 5
+  min_lr: 0.00001
+
+  # Single-task loss (detection only)
+  lambda_detection: 1.0
+  # NO depth loss!
+
+  # Early stopping
+  patience: 15
+  min_delta: 0.001
+
+# ============================================
+# DATA CONFIGURATION
+# ============================================
+
+data:
+  # KITTI dataset
+  root_path: /path/to/kitti
+  train_split: train
+  val_split: val
+  test_split: test
+
+  # Data augmentation
+  augmentation: true
+
+  # Point cloud augmentation
+  point_aug_range: 0.2  # +/- 0.2m
+  point_noise_std: 0.01
+
+  # Image augmentation
+  img_flip: 0.5
+  img_rotate: 0.5
+  img_brightness: 0.3
+  img_contrast: 0.2
+
+# ============================================
+# LOSS CONFIGURATION
+# ============================================
+
+loss:
+  # Detection losses
+  heatmap:
+    type: focal
+    alpha: 0.25
+    beta: 2.0
+    gamma: 2.0
+
+  offset:
+    type: l1
+    weight: 1.0
+
+  size:
+    type: l1
+    weight: 1.0
+
+  rotation:
+    type: smooth_l1
+    beta: 0.1
+    weight: 1.0
+
+  # NO depth loss!
+
+# ============================================
+# EVALUATION CONFIGURATION
+# ============================================
+
+evaluation:
+  # Detection evaluation (KITTI style)
+  iou_thresholds: [0.5, 0.7]
+  difficulty_levels: [easy, moderate, hard]
+
+  # Visualization
+  vis_threshold: 0.3  # Confidence threshold
+  save_predictions: true
+
+  # Metrics to compute
+  detection_metrics:
+    - ap
+    - precision
+    - recall
+    - f1
+    - fpf  # false positive per image
+
+# ============================================
+# JETSON DEPLOYMENT CONFIGURATION
+# ============================================
+
+jetson:
+  # Target specifications
+  target_fps: 30  # Minimum FPS for real-time
+  target_latency: 33  # Maximum latency in ms
+
+  # Optimizations
+  use_fp16: true
+  use_tensorrt: true
+  use_int8: false  # Optional, untuk optimasi lanjutan
+
+  # TensorRT conversion
+  tensorrt_fp16: true
+  tensorrt_workspace: 4096  # 4GB workspace
+
+  # Batch size untuk inference (di Jetson)
+  inference_batch_size: 1
+
+  # Power mode
+  power_mode: 15W  # 15W or 30W (MAX-N)
+
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
+
+logging:
+  log_dir: ./results/logs
+  checkpoint_dir: ./results/checkpoints
+
+  # Save checkpoints
+  save_freq: 5  # Save every N epochs
+
+  # TensorBoard
+  tensorboard: true
+  log_freq: 100  # Log every N iterations
+
+  # Print to console
+  print_freq: 10
+
+# ============================================
+# SYSTEM CONFIGURATION
+# ============================================
+
+system:
+  # GPU settings
+  num_workers: 4
+  pin_memory: true
+  cudnn_benchmark: true
+
+  # Mixed precision
+  use_amp: false
+
+  # Distributed training
+  distributed: false
+  world_size: 1
+
+# ============================================
+# EXPERIMENT CONFIGURATION
+# ============================================
+
+experiment:
+  name: deepfusion_detection_jetson
+  description: "DeepFusion Object Detection with Jetson Orin Deployment"
+
+  # Tags for tracking
+  tags:
+    - lidar_camera_fusion
+    - object_detection
+    - kitti
+    - jetson_optimization
+
+  # Notes
+  notes: "Implementation of DeepFusion (CVPR 2022) for 3D object detection with deployment to Jetson AGX Orin"
