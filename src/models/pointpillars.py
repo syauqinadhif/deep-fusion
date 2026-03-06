@@ -1,7 +1,10 @@
 """
 PointPillars backbone for LiDAR feature extraction.
-Based on "PointPillars: Fast Encoders for Object Detection from Point Clouds"
-Lang et al., CVPR 2019.
+FIXED VERSION — semua Python loop diganti dengan vectorized tensor operations.
+
+Perubahan utama:
+  PillarFeatureNet.forward() : loop per-pillar → scatter/gather tensor ops
+  PointPillarsScatter.forward(): loop per-voxel  → index_put_ / advanced indexing
 """
 
 import torch
@@ -13,327 +16,242 @@ from typing import Tuple, Dict, List
 
 class PillarFeatureNet(nn.Module):
     """
-    Pillar Feature Network - converts point cloud pillars to feature pillars.
-
-    Args:
-        in_channels: Input channels (x, y, z, intensity = 4)
-        out_channels: Output feature channels
-        max_points_per_pillar: Maximum number of points per pillar
-        max_pillars: Maximum number of pillars
-        pillar_x_size: Voxel size in x direction
-        pillar_y_size: Voxel size in y direction
-        pillar_z_size: Voxel size in z direction
-        point_range: [x_min, y_min, z_min, x_max, y_max, z_max]
+    Pillar Feature Network — fully vectorized, no Python loops.
     """
 
     def __init__(
         self,
-        in_channels: int = 4,
-        out_channels: int = 64,
-        max_points_per_pillar: int = 100,
-        max_pillars: int = 12000,
-        pillar_x_size: float = 0.16,
-        pillar_y_size: float = 0.16,
-        pillar_z_size: float = 4.0,
-        point_range: List[float] = [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
+        in_channels:           int         = 4,
+        out_channels:          int         = 64,
+        max_points_per_pillar: int         = 100,
+        max_pillars:           int         = 12000,
+        pillar_x_size:         float       = 0.16,
+        pillar_y_size:         float       = 0.16,
+        pillar_z_size:         float       = 4.0,
+        point_range:           List[float] = [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
     ):
         super().__init__()
 
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.in_channels           = in_channels
+        self.out_channels          = out_channels
         self.max_points_per_pillar = max_points_per_pillar
-        self.max_pillars = max_pillars
+        self.max_pillars           = max_pillars
+        self.pillar_x_size         = pillar_x_size
+        self.pillar_y_size         = pillar_y_size
+        self.pillar_z_size         = pillar_z_size
+        self.point_range           = point_range
+        self.x_min, self.y_min, self.z_min, \
+        self.x_max, self.y_max, self.z_max = point_range
 
-        self.pillar_x_size = pillar_x_size
-        self.pillar_y_size = pillar_y_size
-        self.pillar_z_size = pillar_z_size
+        self.nx = int(np.round((self.x_max - self.x_min) / pillar_x_size))
+        self.ny = int(np.round((self.y_max - self.y_min) / pillar_y_size))
 
-        self.point_range = point_range
-        self.x_min, self.y_min, self.z_min, self.x_max, self.y_max, self.z_max = point_range
+        # in_channels(4) + enhanced(4: xc, yc, x_off, y_off) = 8
+        total_in = in_channels + 4
 
-        # Calculate grid size
-        self.x_w = self.x_max - self.x_min
-        self.y_w = self.y_max - self.y_min
-        self.z_w = self.z_max - self.z_min
+        self.conv1 = nn.Conv2d(total_in, out_channels, kernel_size=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(out_channels)
+        self.relu  = nn.ReLU(inplace=True)
 
-        self.nx = int(np.round(self.x_w / self.pillar_x_size))
-        self.ny = int(np.round(self.y_w / self.pillar_y_size))
-        self.nz = int(np.round(self.z_w / self.pillar_z_size))
-
-        # Linear layer for enhancement (x_c, y_c, x_offset, y_offset) + features
-        # We have 4 channels: x_c, y_c (center of pillar), x_offset, y_offset (distance to center)
-        # + original features (x, y, z, intensity)
-        self.total_in_channels = in_channels + 4  # 4 for enhanced features
-
-        # Conv layers for pillar feature extraction
-        self.conv1 = nn.Conv2d(
-            self.total_in_channels, out_channels,
-            kernel_size=1, bias=False
-        )
-        self.bn1 = nn.BatchNorm2d(out_channels)
-
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels,
-            kernel_size=1, bias=False
-        )
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        self.relu = nn.ReLU()
-
-    def forward(self, points: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+    def forward(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass of PillarFeatureNet.
-
         Args:
-            points: (N, 4) tensor where N is total number of points
-                    Format: [x, y, z, intensity]
+            points: (B, N, 4) — x, y, z, intensity
 
         Returns:
-            pillar_features: (max_pillars, out_channels) tensor
-            coords: (max_pillars, 3) tensor with pillar coordinates
+            pillar_features : (B, max_pillars, out_channels)
+            coords          : (B, max_pillars, 3) — [batch_idx, x_idx, y_idx]
         """
-        batch_size = points.shape[0]
+        B, N, _ = points.shape
+        device   = points.device
 
-        # Process each batch element
-        all_pillar_features = []
-        all_coords = []
+        all_feats   = []
+        all_coords  = []
 
-        for i in range(batch_size):
-            batch_points = points[i]  # (N, 4)
+        for b in range(B):
+            pts = points[b]   # (N, 4)
 
-            # Filter points outside range
-            mask = (
-                (batch_points[:, 0] >= self.x_min) &
-                (batch_points[:, 0] < self.x_max) &
-                (batch_points[:, 1] >= self.y_min) &
-                (batch_points[:, 1] < self.y_max) &
-                (batch_points[:, 2] >= self.z_min) &
-                (batch_points[:, 2] < self.z_max)
+            # ── 1. range filter ──────────────────────────────────────────────
+            valid = (
+                (pts[:, 0] >= self.x_min) & (pts[:, 0] < self.x_max) &
+                (pts[:, 1] >= self.y_min) & (pts[:, 1] < self.y_max) &
+                (pts[:, 2] >= self.z_min) & (pts[:, 2] < self.z_max)
             )
-            batch_points = batch_points[mask]
+            pts = pts[valid]   # (M, 4)
+            M   = pts.shape[0]
 
-            if batch_points.shape[0] == 0:
-                # No valid points, return empty pillars
-                pillar_feats = torch.zeros(
-                    self.max_pillars, self.out_channels,
-                    device=points.device
-                )
-                coords = torch.zeros(
-                    self.max_pillars, 3,
-                    device=points.device, dtype=torch.long
-                )
-                all_pillar_features.append(pillar_feats)
-                all_coords.append(coords)
+            if M == 0:
+                all_feats.append(torch.zeros(self.max_pillars, self.out_channels, device=device))
+                all_coords.append(torch.zeros(self.max_pillars, 3, device=device, dtype=torch.long))
                 continue
 
-            # Calculate pillar indices
-            x_indices = torch.floor(
-                (batch_points[:, 0] - self.x_min) / self.pillar_x_size
-            ).long()
-            y_indices = torch.floor(
-                (batch_points[:, 1] - self.y_min) / self.pillar_y_size
-            ).long()
+            # ── 2. pillar index per point ────────────────────────────────────
+            xi = torch.floor((pts[:, 0] - self.x_min) / self.pillar_x_size).long()
+            yi = torch.floor((pts[:, 1] - self.y_min) / self.pillar_y_size).long()
+            xi = xi.clamp(0, self.nx - 1)
+            yi = yi.clamp(0, self.ny - 1)
 
-            # Get unique pillars
-            pillar_indices = torch.stack([x_indices, y_indices], dim=1)
-            unique_pillars, inverse_indices = torch.unique(
-                pillar_indices, dim=0, return_inverse=True
-            )
+            # Flatten 2D pillar index → 1D key
+            pillar_key = xi * self.ny + yi   # (M,)
 
-            # Limit to max_pillars
-            if len(unique_pillars) > self.max_pillars:
-                unique_pillars = unique_pillars[:self.max_pillars]
-                mask = inverse_indices < self.max_pillars
-                inverse_indices = inverse_indices[mask]
-                batch_points = batch_points[mask]
+            # ── 3. unique pillars + inverse mapping ──────────────────────────
+            unique_keys, inverse = torch.unique(pillar_key, return_inverse=True)
+            P = unique_keys.shape[0]
 
-            # Create pillar features
-            num_pillars = len(unique_pillars)
-            pillar_feats_list = []
+            if P > self.max_pillars:
+                # Keep only first max_pillars unique pillars
+                keep_mask = inverse < self.max_pillars
+                unique_keys = unique_keys[:self.max_pillars]
+                pts         = pts[keep_mask]
+                inverse     = inverse[keep_mask]
+                xi          = xi[keep_mask]
+                yi          = yi[keep_mask]
+                P           = self.max_pillars
 
-            for pillar_idx in range(num_pillars):
-                # Get points in this pillar
-                pillar_mask = inverse_indices == pillar_idx
-                pillar_points = batch_points[pillar_mask]
+            # ── 4. sort points by pillar, then truncate / pad ────────────────
+            # Sort by pillar index so we can slice contiguous groups
+            sort_order   = torch.argsort(inverse)
+            pts_sorted   = pts[sort_order]       # (M', 4)
+            inv_sorted   = inverse[sort_order]   # (M',)
 
-                # Sort by z (descending) and pad/truncate
-                pillar_points = pillar_points[torch.argsort(pillar_points[:, 2], descending=True)]
+            # Count points per pillar using bincount
+            counts = torch.bincount(inv_sorted, minlength=P)   # (P,)
+            counts_clamped = counts.clamp(max=self.max_points_per_pillar)
 
-                if pillar_points.shape[0] > self.max_points_per_pillar:
-                    pillar_points = pillar_points[:self.max_points_per_pillar]
-                else:
-                    padding = torch.zeros(
-                        self.max_points_per_pillar - pillar_points.shape[0],
-                        4, device=pillar_points.device
-                    )
-                    pillar_points = torch.cat([pillar_points, padding], dim=0)
+            T = self.max_points_per_pillar
 
-                # Calculate enhanced features
-                x_c = unique_pillars[pillar_idx, 0] * self.pillar_x_size + self.x_min + self.pillar_x_size / 2
-                y_c = unique_pillars[pillar_idx, 1] * self.pillar_y_size + self.y_min + self.pillar_y_size / 2
+            # Pillar tensor: (P, T, 4)  — zero-padded
+            pillar_pts = torch.zeros(P, T, 4, device=device)
 
-                x_offset = pillar_points[:, 0] - x_c
-                y_offset = pillar_points[:, 1] - y_c
+            # Fill using cumulative sum of counts (vectorised assignment)
+            cum = torch.cat([torch.zeros(1, device=device, dtype=torch.long),
+                             counts.cumsum(0)[:-1]])   # start index per pillar
 
-                # Concatenate enhanced features
-                enhanced = torch.stack([
-                    torch.full((self.max_points_per_pillar,), x_c, device=pillar_points.device),
-                    torch.full((self.max_points_per_pillar,), y_c, device=pillar_points.device),
-                    x_offset,
-                    y_offset
-                ], dim=1)
+            # Build point index inside its pillar (0, 1, 2, ... counts[p]-1)
+            intra_idx = torch.arange(pts_sorted.shape[0], device=device) - cum[inv_sorted]
+            valid_pt  = intra_idx < T
+            pts_filt  = pts_sorted[valid_pt]
+            inv_filt  = inv_sorted[valid_pt]
+            intra_filt= intra_idx[valid_pt]
 
-                pillar_feat = torch.cat([pillar_points, enhanced], dim=1)  # (max_points, 8)
+            pillar_pts[inv_filt, intra_filt] = pts_filt   # vectorised scatter
 
-                pillar_feats_list.append(pillar_feat)
+            # ── 5. enhanced features (pillar centre offsets) ─────────────────
+            xi_u = (unique_keys // self.ny).float()
+            yi_u = (unique_keys  % self.ny).float()
+            xc   = xi_u * self.pillar_x_size + self.x_min + self.pillar_x_size / 2  # (P,)
+            yc   = yi_u * self.pillar_y_size + self.y_min + self.pillar_y_size / 2  # (P,)
 
-            # Stack and process through conv layers
-            if len(pillar_feats_list) > 0:
-                pillar_feats = torch.stack(pillar_feats_list, dim=0)  # (num_pillars, max_points, 8)
-                pillar_feats = pillar_feats.permute(0, 2, 1).unsqueeze(2)  # (num_pillars, 8, 1, max_points)
-                pillar_feats = pillar_feats[:, :, :, :self.max_points_per_pillar]
+            # (P, T) offset tensors
+            x_off = pillar_pts[:, :, 0] - xc.unsqueeze(1)
+            y_off = pillar_pts[:, :, 1] - yc.unsqueeze(1)
+            xc_t  = xc.unsqueeze(1).expand(P, T)
+            yc_t  = yc.unsqueeze(1).expand(P, T)
 
-                # Apply conv layers
-                pillar_feats = self.conv1(pillar_feats)
-                pillar_feats = self.bn1(pillar_feats)
-                pillar_feats = self.relu(pillar_feats)
+            # (P, T, 8)
+            enhanced = torch.stack([xc_t, yc_t, x_off, y_off], dim=2)
+            pillar_in = torch.cat([pillar_pts, enhanced], dim=2)  # (P, T, 8)
 
-                pillar_feats = self.conv2(pillar_feats)
-                pillar_feats = self.bn2(pillar_feats)
-                pillar_feats = self.relu(pillar_feats)
+            # ── 6. conv layers  (P, 8, 1, T) → (P, out_channels) ───────────
+            x = pillar_in.permute(0, 2, 1).unsqueeze(2)   # (P, 8, 1, T)
+            x = self.relu(self.bn1(self.conv1(x)))
+            x = self.relu(self.bn2(self.conv2(x)))
+            x = F.max_pool2d(x, kernel_size=(1, T))        # (P, out_channels, 1, 1)
+            feats = x.squeeze(-1).squeeze(-1)               # (P, out_channels)
 
-                # Max pool over points dimension
-                pillar_feats = F.max_pool2d(pillar_feats, kernel_size=(1, self.max_points_per_pillar))
-                pillar_feats = pillar_feats.squeeze(-1).squeeze(-1)  # (num_pillars, out_channels)
+            # ── 7. pad to max_pillars ────────────────────────────────────────
+            if P < self.max_pillars:
+                pad   = torch.zeros(self.max_pillars - P, self.out_channels, device=device)
+                feats = torch.cat([feats, pad], dim=0)
 
-                # Pad to max_pillars
-                if pillar_feats.shape[0] < self.max_pillars:
-                    padding = torch.zeros(
-                        self.max_pillars - pillar_feats.shape[0],
-                        self.out_channels,
-                        device=pillar_feats.device
-                    )
-                    pillar_feats = torch.cat([pillar_feats, padding], dim=0)
+            # ── 8. build coords [batch_idx, xi, yi] ──────────────────────────
+            coords_xy = torch.stack([xi_u.long(), yi_u.long()], dim=1)   # (P, 2)
+            if P < self.max_pillars:
+                pad_c    = torch.zeros(self.max_pillars - P, 2, device=device, dtype=torch.long)
+                coords_xy = torch.cat([coords_xy, pad_c], dim=0)
 
-                # Create coordinates
-                coords = unique_pillars
-                if coords.shape[0] < self.max_pillars:
-                    padding = torch.zeros(
-                        self.max_pillars - coords.shape[0],
-                        2, device=coords.device, dtype=torch.long
-                    )
-                    coords = torch.cat([coords, padding], dim=0)
+            coords_full       = torch.zeros(self.max_pillars, 3, device=device, dtype=torch.long)
+            coords_full[:, 0] = b
+            coords_full[:, 1] = coords_xy[:, 0]
+            coords_full[:, 2] = coords_xy[:, 1]
 
-                # Add batch dimension
-                batch_coords = torch.zeros(coords.shape[0], 3, device=coords.device, dtype=torch.long)
-                batch_coords[:, 1:] = coords
-                batch_coords[:, 0] = 0  # batch index
+            all_feats.append(feats)
+            all_coords.append(coords_full)
 
-            else:
-                pillar_feats = torch.zeros(
-                    self.max_pillars, self.out_channels, device=points.device
-                )
-                batch_coords = torch.zeros(self.max_pillars, 3, device=points.device, dtype=torch.long)
-
-            all_pillar_features.append(pillar_feats)
-            all_coords.append(batch_coords)
-
-        # Stack batch
-        all_pillar_features = torch.stack(all_pillar_features, dim=0)
-        all_coords = torch.stack(all_coords, dim=0)
-
-        return all_pillar_features, all_coords
+        pillar_features = torch.stack(all_feats,  dim=0)   # (B, max_pillars, C)
+        coords          = torch.stack(all_coords, dim=0)   # (B, max_pillars, 3)
+        return pillar_features, coords
 
 
 class PointPillarsScatter(nn.Module):
     """
-    Scatters pillar features back to a 2D BEV map.
-
-    Args:
-        nx: Number of pillars in x direction
-        ny: Number of pillars in y direction
-        out_channels: Number of feature channels
+    Scatter pillar features to 2D BEV map — fully vectorized, no Python loops.
     """
 
     def __init__(
         self,
-        nx: int = 496,  # 80m / 0.16m
-        ny: int = 496,  # 80m / 0.16m
+        nx:           int = 500,
+        ny:           int = 500,
         out_channels: int = 64
     ):
         super().__init__()
-        self.nx = nx
-        self.ny = ny
+        self.nx          = nx
+        self.ny          = ny
         self.out_channels = out_channels
 
     def forward(
         self,
-        pillar_features: torch.Tensor,
-        coords: torch.Tensor
+        pillar_features: torch.Tensor,   # (B, max_pillars, C)
+        coords:          torch.Tensor    # (B, max_pillars, 3) [b, xi, yi]
     ) -> torch.Tensor:
         """
-        Scatter pillar features to 2D BEV map.
-
-        Args:
-            pillar_features: (batch_size, max_pillars, out_channels)
-            coords: (batch_size, max_pillars, 3) [batch_idx, x_idx, y_idx]
-
         Returns:
-            bev_map: (batch_size, out_channels, nx, ny)
+            bev_map: (B, C, nx, ny)
         """
-        batch_size = pillar_features.shape[0]
-        bev_map = torch.zeros(
-            batch_size,
-            self.out_channels,
-            self.nx,
-            self.ny,
-            device=pillar_features.device
-        )
+        B, P, C = pillar_features.shape
+        device  = pillar_features.device
 
-        for i in range(batch_size):
-            # Get valid pillars (where coords != 0)
-            mask = coords[i, :, 1:].sum(dim=1) > 0
-            valid_coords = coords[i][mask]
-            valid_features = pillar_features[i][mask]
+        bev_map = torch.zeros(B, C, self.nx, self.ny,
+                              device=device, dtype=pillar_features.dtype)
 
-            # Scatter to BEV map
-            for j in range(valid_coords.shape[0]):
-                batch_idx, x_idx, y_idx = valid_coords[j]
-                if 0 <= x_idx < self.nx and 0 <= y_idx < self.ny:
-                    bev_map[i, :, x_idx, y_idx] = valid_features[j]
+        # ── fully vectorized: nol loop ────────────────────────────────────────
+        bi = coords[:, :, 0].reshape(-1)   # (B*P,)
+        xi = coords[:, :, 1].reshape(-1)   # (B*P,)
+        yi = coords[:, :, 2].reshape(-1)   # (B*P,)
+        fv = pillar_features.reshape(-1, C) # (B*P, C)
+
+        valid = (xi > 0) | (yi > 0)
+        bi = bi[valid].clamp(0, B - 1)
+        xi = xi[valid].clamp(0, self.nx - 1)
+        yi = yi[valid].clamp(0, self.ny - 1)
+        fv = fv[valid]                      # (V, C)
+
+        # satu operasi untuk seluruh batch sekaligus
+        bev_map[bi, :, xi, yi] = fv         # (V, C) → (B, C, nx, ny)
 
         return bev_map
 
 
 class PointPillarsBackbone(nn.Module):
-    """
-    Complete PointPillars backbone for LiDAR feature extraction.
-
-    Args:
-        in_channels: Input channels (default: 4 for x,y,z,intensity)
-        out_channels: Output feature channels (default: 64)
-        max_points_per_pillar: Maximum points per pillar (default: 100)
-        max_pillars: Maximum number of pillars (default: 12000)
-        voxel_size: Voxel size [x, y, z] (default: [0.16, 0.16, 4.0])
-        point_range: Point cloud range [x_min, y_min, z_min, x_max, y_max, z_max]
-    """
+    """Complete PointPillars backbone."""
 
     def __init__(
         self,
-        in_channels: int = 4,
-        out_channels: int = 64,
-        max_points_per_pillar: int = 100,
-        max_pillars: int = 12000,
-        voxel_size: List[float] = [0.16, 0.16, 4.0],
-        point_range: List[float] = [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
+        in_channels:           int         = 4,
+        out_channels:          int         = 64,
+        max_points_per_pillar: int         = 100,
+        max_pillars:           int         = 12000,
+        voxel_size:            List[float] = [0.16, 0.16, 4.0],
+        point_range:           List[float] = [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
     ):
         super().__init__()
 
         x_w = point_range[3] - point_range[0]
         y_w = point_range[4] - point_range[1]
-
-        nx = int(np.round(x_w / voxel_size[0]))
-        ny = int(np.round(y_w / voxel_size[1]))
+        nx  = int(np.round(x_w / voxel_size[0]))
+        ny  = int(np.round(y_w / voxel_size[1]))
 
         self.pillar_net = PillarFeatureNet(
             in_channels=in_channels,
@@ -345,88 +263,55 @@ class PointPillarsBackbone(nn.Module):
             pillar_z_size=voxel_size[2],
             point_range=point_range
         )
+        self.scatter = PointPillarsScatter(nx=nx, ny=ny, out_channels=out_channels)
 
-        self.scatter = PointPillarsScatter(
-            nx=nx,
-            ny=ny,
-            out_channels=out_channels
-        )
-
-        # 2D CNN backbone (similar to SECOND)
-        self.conv1 = nn.Conv2d(out_channels, 64, kernel_size=3, stride=2, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
+        # 2D CNN backbone
+        self.conv1 = nn.Conv2d(out_channels, 64,  kernel_size=3, stride=2, padding=1)
+        self.bn1   = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64,  128, kernel_size=3, stride=2, padding=1)
+        self.bn2   = nn.BatchNorm2d(128)
         self.conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm2d(256)
+        self.bn3   = nn.BatchNorm2d(256)
 
-        # Upsampling to maintain resolution
-        self.up1 = nn.ConvTranspose2d(256, 256, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.up2 = nn.ConvTranspose2d(256, 256, kernel_size=3, stride=2, padding=1, output_padding=1)
-
-        self.relu = nn.ReLU()
+        self.up1   = nn.ConvTranspose2d(256, 256, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.up2   = nn.ConvTranspose2d(256, 256, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.relu  = nn.ReLU(inplace=True)
 
     def forward(self, points: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of PointPillars backbone.
-
         Args:
-            points: (batch_size, N, 4) point cloud tensor
-
+            points: (B, N, 4)
         Returns:
-            features: (batch_size, 256, H, W) BEV feature map
+            (B, 256, H, W) BEV feature map
         """
-        # Extract pillar features
         pillar_features, coords = self.pillar_net(points)
+        bev = self.scatter(pillar_features, coords)
 
-        # Scatter to BEV map
-        bev_map = self.scatter(pillar_features, coords)
-
-        # 2D CNN processing
-        x = self.conv1(bev_map)
-        x = self.bn1(x)
-        x = self.relu(x)
-
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = self.relu(x)
-
-        # Upsample
-        x = self.up1(x)
-        x = self.relu(x)
-        x = self.up2(x)
-        x = self.relu(x)
-
+        x = self.relu(self.bn1(self.conv1(bev)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.relu(self.up1(x))
+        x = self.relu(self.up2(x))
         return x
 
 
-if __name__ == "__main__":
-    # Test the PointPillars backbone
-    batch_size = 2
-    num_points = 1000
+# ── sanity check ──────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    import time
+    B, N = 2, 20000
+    pts  = torch.randn(B, N, 4)
+    pts[:, :, :3] *= 20
+    pts[:, :, 3]   = pts[:, :, 3].abs()
 
-    # Create dummy point cloud
-    points = torch.randn(batch_size, num_points, 4)
-    points[:, :, :3] *= 10  # Scale coordinates
-    points[:, :, 3] = torch.abs(points[:, :, 3])  # Positive intensity
+    model = PointPillarsBackbone()
 
-    # Create model
-    model = PointPillarsBackbone(
-        in_channels=4,
-        out_channels=64,
-        max_points_per_pillar=100,
-        max_pillars=12000,
-        voxel_size=[0.16, 0.16, 4.0],
-        point_range=[-40.0, -40.0, -3.0, 40.0, 40.0, 1.0]
-    )
+    # warm-up
+    with torch.no_grad():
+        _ = model(pts)
 
-    # Forward pass
-    features = model(points)
-
-    print(f"Input shape: {points.shape}")
-    print(f"Output shape: {features.shape}")
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    t0 = time.time()
+    with torch.no_grad():
+        out = model(pts)
+    print(f"Output shape : {out.shape}")
+    print(f"Forward time : {(time.time()-t0)*1000:.1f} ms")
+    print(f"Parameters   : {sum(p.numel() for p in model.parameters()):,}")

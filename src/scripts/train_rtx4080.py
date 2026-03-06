@@ -1,477 +1,395 @@
 #!/usr/bin/env python3
 """
 Training script for DeepFusion on RTX 4080.
-Optimized for maximum performance on NVIDIA GPUs.
-
-Usage:
-    python train_rtx4080.py --config ../config_rtx4080.yaml --data_path /path/to/kitti
+OPTIMIZED VERSION:
+  1. torch.compile()          — ~20-30% speedup gratis (PyTorch 2.0+)
+  2. prefetch_factor=4        — DataLoader lebih agresif prefetch
+  3. GPU util monitor         — tampilkan GPU% setiap epoch
+  4. AMP + unscale sebelum clip_grad
+  5. aug_params diteruskan sebagai list[B]
+  6. save_checkpoint aman untuk torch.compile (_orig_mod)
 """
 
 import os
 import sys
 import argparse
-import yaml
 import time
-from datetime import datetime
 from pathlib import Path
-from tqdm import tqdm
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-# Check for CUDA
+# ── Device setup ──────────────────────────────────────────────────────────────
 if torch.cuda.is_available():
     device = torch.device('cuda')
-    print(f"✓ Using CUDA (NVIDIA GPU)")
-    print(f"  GPU: {torch.cuda.get_device_name(0)}")
-    print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print(f"  CUDA Version: {torch.version.cuda}")
+    print(f"✓ Using CUDA — {torch.cuda.get_device_name(0)}")
+    print(f"  VRAM    : {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    print(f"  CUDA    : {torch.version.cuda}")
+    print(f"  PyTorch : {torch.__version__}")
 else:
     device = torch.device('cpu')
     print("⚠ CUDA not available, using CPU")
 
-# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import DeepFusion, DeepFusionLite
+from models import DeepFusion
 from datasets import KITTIDataset, get_training_transforms, get_val_transforms, collate_fn
 from utils import (
-    load_config, save_checkpoint, count_parameters,
-    seed_everything, EarlyStopping, AverageMeter, LossTracker, get_lr_scheduler
+    load_config, count_parameters, seed_everything,
+    EarlyStopping, AverageMeter, LossTracker, get_lr_scheduler
 )
 
 
-def get_device():
-    """Get CUDA device if available."""
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    return torch.device('cpu')
+def get_gpu_util() -> str:
+    """Baca GPU utilization % via nvidia-smi."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ['nvidia-smi',
+             '--query-gpu=utilization.gpu,memory.used,memory.total',
+             '--format=csv,noheader,nounits'],
+            encoding='utf-8', timeout=2
+        ).strip().split(',')
+        util  = out[0].strip()
+        mem_u = int(out[1].strip())
+        mem_t = int(out[2].strip())
+        return f"GPU {util}% | VRAM {mem_u}/{mem_t} MiB"
+    except Exception:
+        return ""
 
 
 class Trainer:
-    """Trainer for RTX 4080 with CUDA optimizations."""
-
     def __init__(self, config: dict, args):
         self.config = config
-        self.args = args
-        self.device = get_device()
+        self.args   = args
+        self.device = device
         self.setup_directories()
 
-        # Set random seeds
         seed_everything(42)
 
-        # Build model
+        # ── Model ─────────────────────────────────────────────────────────────
         print("\n" + "="*60)
         print("Building Model")
         print("="*60)
-        self.model = self.build_model()
-        self.model.to(self.device)
+        self.model = self.build_model().to(self.device)
+        print(f"Parameters : {count_parameters(self.model):,}")
 
-        # Print model info
-        total_params = count_parameters(self.model)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Device: {self.device}")
-
-        # Enable cuDNN auto-tuner
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
-            print("✓ cuDNN auto-tuner enabled")
+            print("✓ cuDNN benchmark enabled")
 
-        # Build datasets
+            # torch.compile — ~20-30% speedup gratis di PyTorch >= 2.0
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+                print("✓ torch.compile enabled (mode=reduce-overhead)")
+            except Exception as e:
+                print(f"⚠ torch.compile skip: {e}")
+
+        # ── Datasets & loaders ────────────────────────────────────────────────
         print("\n" + "="*60)
         print("Loading Datasets")
         print("="*60)
         self.train_dataset, self.val_dataset = self.build_datasets()
+        self.train_loader,  self.val_loader  = self.build_data_loaders()
 
-        # Build data loaders
-        self.train_loader, self.val_loader = self.build_data_loaders()
-
-        # Build optimizer
+        # ── Optimizer & scheduler ─────────────────────────────────────────────
         self.optimizer = self.build_optimizer()
-
-        # Build scheduler
         self.scheduler = self.build_scheduler()
 
-        # Mixed precision training (AMP)
-        system_config = config.get('system', {})
-        self.use_amp = system_config.get('use_amp', True)
-        if self.use_amp and self.device.type == 'cuda':
-            self.scaler = torch.cuda.amp.GradScaler()
+        # ── Mixed precision ───────────────────────────────────────────────────
+        sys_cfg      = config.get('system', {})
+        self.use_amp = sys_cfg.get('use_amp', True) and self.device.type == 'cuda'
+        self.scaler  = torch.amp.GradScaler('cuda') if self.use_amp else None
+        if self.use_amp:
             print("✓ Mixed precision (FP16) enabled")
-        else:
-            self.scaler = None
 
-        # Early stopping
-        early_stop_config = config.get('training', {}).get('early_stopping', {})
+        # ── Early stopping ────────────────────────────────────────────────────
+        es_cfg = config.get('training', {}).get('early_stopping', {})
         self.early_stopping = EarlyStopping(
-            patience=early_stop_config.get('patience', 15),
-            min_delta=early_stop_config.get('min_delta', 0.001),
-            mode='min'
+            patience  = es_cfg.get('patience',  15),
+            min_delta = es_cfg.get('min_delta', 0.001),
+            mode      = 'min'
         )
 
-        # Training state
-        self.current_epoch = 0
-        self.best_val_loss = float('inf')
-        self.loss_tracker = LossTracker()
-
-        # Logging
-        self.log_interval = config.get('logging', {}).get('log_freq', 100)
+        # ── State ─────────────────────────────────────────────────────────────
+        self.current_epoch  = 0
+        self.best_val_loss  = float('inf')
+        self.loss_tracker   = LossTracker()
         self.print_interval = config.get('logging', {}).get('print_freq', 10)
 
+    # ── directories ───────────────────────────────────────────────────────────
     def setup_directories(self):
-        """Setup output directories."""
-        self.output_dir = Path(self.args.output_dir) if self.args.output_dir else Path('./results')
+        self.output_dir     = Path(self.args.output_dir) if self.args.output_dir else Path('./results')
         self.checkpoint_dir = self.output_dir / 'checkpoints'
-        self.log_dir = self.output_dir / 'logs'
-
+        self.log_dir        = self.output_dir / 'logs'
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── builders ──────────────────────────────────────────────────────────────
     def build_model(self):
-        """Build model from config."""
-        model_config = self.config.get('model', {})
-
-        # Use standard DeepFusion (RTX 4080 can handle it!)
-        model = DeepFusion(
-            lidar_channels=model_config.get('image_features', 256),
-            image_channels=model_config.get('image_features', 256),
-            hidden_dim=model_config.get('hidden_dim', 256),
-            num_heads=model_config.get('n_heads', 8),
-            num_layers=model_config.get('n_layers', 1),
-            num_classes=model_config.get('num_classes', 3),
-            max_objects=model_config.get('max_objects_per_image', 512),
-            image_backbone=model_config.get('image_backbone', 'resnet34'),
-            pretrained_image=model_config.get('pretrained', True),
-            max_points_per_pillar=model_config.get('max_points_per_pillar', 100),
-            max_pillars=model_config.get('max_pillars', 12000),
-            voxel_size=model_config.get('voxel_size', [0.16, 0.16, 4.0]),
-            point_range=model_config.get('point_range', [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0])
+        mc = self.config.get('model', {})
+        return DeepFusion(
+            lidar_channels        = mc.get('image_features',       256),
+            image_channels        = mc.get('image_features',       256),
+            hidden_dim            = mc.get('hidden_dim',           256),
+            num_heads             = mc.get('n_heads',                8),
+            num_layers            = mc.get('n_layers',               1),
+            num_classes           = mc.get('num_classes',            3),
+            max_objects           = mc.get('max_objects_per_image', 512),
+            image_backbone        = mc.get('image_backbone',  'resnet34'),
+            pretrained_image      = mc.get('pretrained',          True),
+            max_points_per_pillar = mc.get('max_points_per_pillar', 100),
+            max_pillars           = mc.get('max_pillars',        12000),
+            voxel_size            = mc.get('voxel_size',  [0.16, 0.16, 4.0]),
+            point_range           = mc.get('point_range',
+                                           [-40.0, -40.0, -3.0, 40.0, 40.0, 1.0])
         )
-
-        return model
 
     def build_datasets(self):
-        """Build training and validation datasets."""
-        data_config = self.config.get('data', {})
-
-        # Training dataset
-        train_transforms = get_training_transforms(self.config)
         train_dataset = KITTIDataset(
-            root_path=self.args.data_path,
-            split='train',
-            transform=train_transforms,
-            class_names=['Car', 'Pedestrian', 'Cyclist'],
-            max_objects=self.config['model']['max_objects_per_image'],
-            voxel_size=self.config['model']['voxel_size'],
-            point_range=self.config['model']['point_range']
+            root_path   = self.args.data_path,
+            split       = 'train',
+            transform   = get_training_transforms(self.config),
+            class_names = ['Car', 'Pedestrian', 'Cyclist'],
+            max_objects = self.config['model']['max_objects_per_image'],
+            voxel_size  = self.config['model']['voxel_size'],
+            point_range = self.config['model']['point_range']
         )
-
-        # Validation dataset
-        val_transforms = get_val_transforms(self.config)
         val_dataset = KITTIDataset(
-            root_path=self.args.data_path,
-            split='val',
-            transform=val_transforms,
-            class_names=['Car', 'Pedestrian', 'Cyclist'],
-            max_objects=self.config['model']['max_objects_per_image'],
-            voxel_size=self.config['model']['voxel_size'],
-            point_range=self.config['model']['point_range']
+            root_path   = self.args.data_path,
+            split       = 'val',
+            transform   = get_val_transforms(self.config),
+            class_names = ['Car', 'Pedestrian', 'Cyclist'],
+            max_objects = self.config['model']['max_objects_per_image'],
+            voxel_size  = self.config['model']['voxel_size'],
+            point_range = self.config['model']['point_range']
         )
-
-        print(f"Training samples: {len(train_dataset)}")
-        print(f"Validation samples: {len(val_dataset)}")
-
+        print(f"Train : {len(train_dataset)} samples")
+        print(f"Val   : {len(val_dataset)} samples")
         return train_dataset, val_dataset
 
     def build_data_loaders(self):
-        """Build data loaders with RTX 4080 optimizations."""
-        train_config = self.config.get('training', {})
-        system_config = self.config.get('system', {})
+        tc = self.config.get('training', {})
+        sc = self.config.get('system',   {})
+        bs = tc.get('batch_size',  8)
+        nw = sc.get('num_workers', 6)   # 6 lebih stabil dari 12 untuk workload ini
 
         train_loader = DataLoader(
             self.train_dataset,
-            batch_size=train_config.get('batch_size', 8),
-            shuffle=True,
-            num_workers=system_config.get('num_workers', 12),
-            pin_memory=system_config.get('pin_memory', True),
-            drop_last=True,
-            collate_fn=collate_fn,
-            prefetch_factor=2,  # RTX 4080 can handle this
-            persistent_workers=True  # Keep workers alive
+            batch_size         = bs,
+            shuffle            = True,
+            num_workers        = nw,
+            pin_memory         = sc.get('pin_memory', True),
+            drop_last          = True,
+            collate_fn         = collate_fn,
+            prefetch_factor    = 4,          # ← naik dari 2, supply data lebih cepat
+            persistent_workers = True
         )
-
         val_loader = DataLoader(
             self.val_dataset,
-            batch_size=train_config.get('batch_size', 8),
-            shuffle=False,
-            num_workers=system_config.get('num_workers', 12),
-            pin_memory=system_config.get('pin_memory', True),
-            collate_fn=collate_fn,
-            persistent_workers=True
+            batch_size         = bs,
+            shuffle            = False,
+            num_workers        = nw,
+            pin_memory         = sc.get('pin_memory', True),
+            collate_fn         = collate_fn,
+            prefetch_factor    = 4,
+            persistent_workers = True
         )
-
+        print(f"DataLoader : batch={bs}, workers={nw}, prefetch=4")
         return train_loader, val_loader
 
     def build_optimizer(self):
-        """Build optimizer."""
-        train_config = self.config.get('training', {})
-
-        optimizer = optim.Adam(
+        tc = self.config.get('training', {})
+        return optim.AdamW(
             self.model.parameters(),
-            lr=train_config.get('learning_rate', 0.001),
-            weight_decay=train_config.get('weight_decay', 0.0001)
+            lr           = tc.get('learning_rate', 1e-3),
+            weight_decay = tc.get('weight_decay',  1e-4)
         )
-
-        return optimizer
 
     def build_scheduler(self):
-        """Build learning rate scheduler."""
-        train_config = self.config.get('training', {})
-
-        scheduler = get_lr_scheduler(
+        tc = self.config.get('training', {})
+        return get_lr_scheduler(
             self.optimizer,
-            scheduler_type=train_config.get('scheduler', 'cosine'),
-            epochs=train_config.get('epochs', 80),
-            min_lr=train_config.get('min_lr', 0.00001)
+            scheduler_type = tc.get('scheduler', 'cosine'),
+            epochs         = tc.get('epochs',    80),
+            min_lr         = tc.get('min_lr',    1e-5)
         )
 
-        return scheduler
-
+    # ── training epoch ────────────────────────────────────────────────────────
     def train_epoch(self, epoch: int, epochs: int) -> dict:
-        """Train for one epoch with mixed precision."""
         self.model.train()
         self.loss_tracker.reset()
-        epoch_loss = AverageMeter()
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{epochs}")
+        pbar        = tqdm(self.train_loader, desc=f"Epoch {epoch}/{epochs}")
+        batch_times = []
+        t0          = time.time()
 
         for batch_idx, batch in enumerate(pbar):
-            # Move data to device
             points = batch['points'].to(self.device, non_blocking=True)
             images = batch['images'].to(self.device, non_blocking=True)
-
-            # Build targets
             targets = {
-                'heatmap': batch['targets']['heatmap'].to(self.device, non_blocking=True),
-                'offset': batch['targets']['offset'].to(self.device, non_blocking=True),
-                'size': batch['targets']['size'].to(self.device, non_blocking=True),
-                'rotation': batch['targets']['rotation'].to(self.device, non_blocking=True),
-                'z_center': batch['targets']['z_center'].to(self.device, non_blocking=True)
+                k: v.to(self.device, non_blocking=True)
+                for k, v in batch['targets'].items()
             }
+            aug_params = batch['aug_params']   # list[B]
 
-            # Forward pass with mixed precision
-            aug_params = batch['aug_params'][0]
-
-            if self.use_amp and self.scaler is not None:
-                with torch.cuda.amp.autocast():
+            if self.use_amp:
+                with torch.amp.autocast('cuda'):
                     output = self.model(points, images, aug_params)
                     loss, loss_dict = self.model.compute_loss(output, targets)
 
-                # Backward pass with gradient scaling
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 output = self.model(points, images, aug_params)
                 loss, loss_dict = self.model.compute_loss(output, targets)
-
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
-            # Update metrics
-            epoch_loss.update(loss.item(), points.size(0))
             self.loss_tracker.update(loss_dict)
 
-            # Update progress bar
+            # progress bar
+            batch_times.append(time.time() - t0)
+            t0 = time.time()
             if batch_idx % self.print_interval == 0:
-                # GPU memory tracking
-                if self.device.type == 'cuda':
-                    mem_allocated = torch.cuda.memory_allocated() / 1024**3
-                    mem_reserved = torch.cuda.memory_reserved() / 1024**3
-                    pbar.set_postfix({
-                        'loss': f'{loss.item():.4f}',
-                        'mem': f'{mem_allocated:.1f}GB'
-                    })
-                else:
-                    pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                avg_t = sum(batch_times[-20:]) / max(len(batch_times[-20:]), 1)
+                mem   = torch.cuda.memory_allocated() / 1024**3 if self.device.type == 'cuda' else 0
+                pbar.set_postfix({
+                    'loss' : f'{loss.item():.3f}',
+                    'mem'  : f'{mem:.1f}GB',
+                    's/it' : f'{avg_t:.2f}'
+                })
 
         return self.loss_tracker.get_average()
 
+    # ── validation ────────────────────────────────────────────────────────────
     def validate(self) -> dict:
-        """Validate the model."""
         self.model.eval()
-        val_loss = AverageMeter()
         self.loss_tracker.reset()
 
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validation"):
+            for batch in tqdm(self.val_loader, desc="Validation", leave=False):
                 points = batch['points'].to(self.device, non_blocking=True)
                 images = batch['images'].to(self.device, non_blocking=True)
-
                 targets = {
-                    'heatmap': batch['targets']['heatmap'].to(self.device, non_blocking=True),
-                    'offset': batch['targets']['offset'].to(self.device, non_blocking=True),
-                    'size': batch['targets']['size'].to(self.device, non_blocking=True),
-                    'rotation': batch['targets']['rotation'].to(self.device, non_blocking=True),
-                    'z_center': batch['targets']['z_center'].to(self.device, non_blocking=True)
+                    k: v.to(self.device, non_blocking=True)
+                    for k, v in batch['targets'].items()
                 }
 
-                # Mixed precision for validation too
                 if self.use_amp:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         output = self.model(points, images, aug_params=None)
-                        loss, loss_dict = self.model.compute_loss(output, targets)
+                        _, loss_dict = self.model.compute_loss(output, targets)
                 else:
                     output = self.model(points, images, aug_params=None)
-                    loss, loss_dict = self.model.compute_loss(output, targets)
+                    _, loss_dict = self.model.compute_loss(output, targets)
 
-                val_loss.update(loss.item(), points.size(0))
                 self.loss_tracker.update(loss_dict)
 
         return self.loss_tracker.get_average()
 
+    # ── main loop ─────────────────────────────────────────────────────────────
     def train(self):
-        """Main training loop."""
         print("\n" + "="*60)
-        print("Starting Training on RTX 4080")
+        print("Starting Training")
         print("="*60)
 
-        epochs = self.config['training']['epochs']
+        epochs    = self.config['training']['epochs']
         save_freq = self.config.get('logging', {}).get('save_freq', 5)
-
-        start_time = time.time()
+        start     = time.time()
 
         for epoch in range(1, epochs + 1):
             self.current_epoch = epoch
 
-            # Train
-            train_metrics = self.train_epoch(epoch, epochs)
+            t_ep    = time.time()
+            train_m = self.train_epoch(epoch, epochs)
+            val_m   = self.validate()
+            ep_min  = (time.time() - t_ep) / 60
 
-            # Validate
-            val_metrics = self.validate()
-
-            # Update learning rate
+            # scheduler
             if self.scheduler is not None:
                 if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step(val_metrics['total'])
+                    self.scheduler.step(val_m['total'])
                 else:
                     self.scheduler.step()
 
-            # Print epoch summary
-            elapsed = time.time() - start_time
-            epoch_time = elapsed / epoch
-            eta = epoch_time * (epochs - epoch + 1)
+            elapsed = time.time() - start
+            eta_h   = (elapsed / epoch) * (epochs - epoch) / 3600
+            gpu_info = get_gpu_util()
 
-            print(f"\nEpoch {epoch}/{epochs}:")
-            print(f"  Train Loss: {train_metrics.get('total', 0):.4f}")
-            print(f"  Val Loss:   {val_metrics.get('total', 0):.4f}")
-            print(f"  LR:         {self.optimizer.param_groups[0]['lr']:.6f}")
-            print(f"  Time:       {epoch_time/60:.1f} min/epoch")
-            print(f"  ETA:        {eta/3600:.1f} hours")
+            print(f"\nEpoch {epoch}/{epochs}  ({ep_min:.1f} min/epoch)")
+            print(f"  Train Loss : {train_m.get('total', 0):.4f}")
+            print(f"  Val Loss   : {val_m.get('total',   0):.4f}")
+            print(f"  LR         : {self.optimizer.param_groups[0]['lr']:.2e}")
+            print(f"  ETA        : {eta_h:.1f} h")
+            if gpu_info:
+                print(f"  {gpu_info}")
 
-            # Save checkpoint
-            is_best = val_metrics.get('total', float('inf')) < self.best_val_loss
+            is_best = val_m.get('total', float('inf')) < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_metrics.get('total', self.best_val_loss)
+                self.best_val_loss = val_m['total']
 
             if epoch % save_freq == 0 or is_best:
                 self.save_checkpoint(epoch, is_best)
 
-            # Early stopping check
-            if self.early_stopping(val_metrics.get('total', float('inf'))):
-                print(f"\nEarly stopping triggered at epoch {epoch}")
+            if self.early_stopping(val_m.get('total', float('inf'))):
+                print(f"\nEarly stopping at epoch {epoch}")
                 break
 
-        total_time = time.time() - start_time
-        print("\n" + "="*60)
-        print("Training Complete!")
-        print(f"Total time: {total_time/3600:.2f} hours")
-        print(f"Best Validation Loss: {self.best_val_loss:.4f}")
-        print("="*60)
+        total_h = (time.time() - start) / 3600
+        print(f"\nDone!  {total_h:.2f} h total  |  Best val loss: {self.best_val_loss:.4f}")
 
+    # ── checkpoint ────────────────────────────────────────────────────────────
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'config': self.config
+        # torch.compile wraps model di _orig_mod — ambil model asli untuk state_dict
+        raw = getattr(self.model, '_orig_mod', self.model)
+        ckpt = {
+            'epoch':            epoch,
+            'model_state_dict': raw.state_dict(),
+            'optim_state_dict': self.optimizer.state_dict(),
+            'best_val_loss':    self.best_val_loss,
+            'config':           self.config
         }
-
-        # Save latest
-        torch.save(checkpoint, self.checkpoint_dir / 'latest.pth.tar')
-
-        # Save best
+        torch.save(ckpt, self.checkpoint_dir / 'latest.pth.tar')
+        torch.save(ckpt, self.checkpoint_dir / f'epoch_{epoch}.pth.tar')
         if is_best:
-            torch.save(checkpoint, self.checkpoint_dir / 'best.pth.tar')
-            print(f"  ✓ Saved best checkpoint (val_loss: {self.best_val_loss:.4f})")
-
-        # Save periodic
-        torch.save(checkpoint, self.checkpoint_dir / f'epoch_{epoch}.pth.tar')
+            torch.save(ckpt, self.checkpoint_dir / 'best.pth.tar')
+            print(f"  ✓ Best checkpoint (val_loss={self.best_val_loss:.4f})")
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
 def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train DeepFusion on RTX 4080')
-
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='./config_rtx4080.yaml',
-        help='Path to configuration file'
-    )
-
-    parser.add_argument(
-        '--data_path',
-        type=str,
-        required=True,
-        help='Path to KITTI dataset'
-    )
-
-    parser.add_argument(
-        '--output_dir',
-        type=str,
-        default='./results',
-        help='Output directory'
-    )
-
-    parser.add_argument(
-        '--resume',
-        type=str,
-        default=None,
-        help='Resume from checkpoint'
-    )
-
-    return parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--config',     default='./config_rtx4080.yaml')
+    p.add_argument('--data_path',  required=True)
+    p.add_argument('--output_dir', default='./results')
+    p.add_argument('--resume',     default=None)
+    return p.parse_args()
 
 
 def main():
-    """Main entry point."""
-    args = parse_args()
-
-    # Load config
-    print(f"Loading configuration from {args.config}")
+    args   = parse_args()
     config = load_config(args.config)
 
-    # Create trainer
     trainer = Trainer(config, args)
 
-    # Resume from checkpoint if specified
     if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume)
-        trainer.model.load_state_dict(checkpoint['model_state_dict'])
-        trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        trainer.current_epoch = checkpoint['epoch']
-        trainer.best_val_loss = checkpoint['best_val_loss']
+        ckpt = torch.load(args.resume, map_location=device)
+        raw  = getattr(trainer.model, '_orig_mod', trainer.model)
+        raw.load_state_dict(ckpt['model_state_dict'])
+        trainer.optimizer.load_state_dict(ckpt['optim_state_dict'])
+        trainer.current_epoch = ckpt['epoch']
+        trainer.best_val_loss = ckpt['best_val_loss']
+        print(f"Resumed from epoch {trainer.current_epoch}")
 
-    # Train
     trainer.train()
 
 

@@ -1,13 +1,12 @@
 """
 DeepFusion Datasets Package
 """
-
 from .kitti import (
     KITTIDataset,
-    KITTIBEVOnly,
+    # KITTIBEVOnly ← DIHAPUS, redundant (hanya wrapper tipis KITTIDataset)
+    # Kalau perlu BEV-only, gunakan KITTIDataset langsung
     collate_fn
 )
-
 from .transforms import (
     DataAugmentation,
     PointCloudTransform,
@@ -19,7 +18,7 @@ from .transforms import (
 
 __all__ = [
     'KITTIDataset',
-    'KITTIBEVOnly',
+    # 'KITTIBEVOnly',  ← dihapus
     'collate_fn',
     'DataAugmentation',
     'PointCloudTransform',

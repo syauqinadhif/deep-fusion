@@ -1,30 +1,19 @@
 """
 Inverse Augmentation module for DeepFusion.
-Handles geometric alignment between LiDAR and camera features after data augmentation.
-
-Key concept: When data is augmented (rotated, flipped, scaled), the LiDAR and camera
-coordinate systems become misaligned. This module reverses the augmentation transforms
-to bring features back to the original coordinate system for proper fusion.
+FIXED VERSION — forward() sekarang menerima:
+  - None                          → no-op
+  - AugmentationParams            → single (lama, backward-compatible)
+  - list[AugmentationParams|None] → per-sample dalam batch (BARU)
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 
 class AugmentationParams:
-    """
-    Container for augmentation parameters.
-
-    Attributes:
-        rotation_angle: Rotation angle in radians
-        flip_x: Whether to flip along x axis
-        flip_y: Whether to flip along y axis
-        scale: Scaling factor
-        translate_x: Translation in x direction (meters)
-        translate_y: Translation in y direction (meters)
-    """
+    """Container for augmentation parameters per sample."""
 
     def __init__(
         self,
@@ -36,361 +25,232 @@ class AugmentationParams:
         translate_y: float = 0.0
     ):
         self.rotation_angle = rotation_angle
-        self.flip_x = flip_x
-        self.flip_y = flip_y
-        self.scale = scale
-        self.translate_x = translate_x
-        self.translate_y = translate_y
+        self.flip_x        = flip_x
+        self.flip_y        = flip_y
+        self.scale         = scale
+        self.translate_x   = translate_x
+        self.translate_y   = translate_y
+
+    def is_identity(self) -> bool:
+        """True jika params ini tidak melakukan transformasi apapun."""
+        return (
+            self.rotation_angle == 0.0
+            and not self.flip_x
+            and not self.flip_y
+            and self.scale == 1.0
+            and self.translate_x == 0.0
+            and self.translate_y == 0.0
+        )
 
     def to_dict(self) -> Dict:
-        """Convert to dictionary."""
         return {
             'rotation_angle': self.rotation_angle,
-            'flip_x': self.flip_x,
-            'flip_y': self.flip_y,
-            'scale': self.scale,
-            'translate_x': self.translate_x,
-            'translate_y': self.translate_y
+            'flip_x':        self.flip_x,
+            'flip_y':        self.flip_y,
+            'scale':         self.scale,
+            'translate_x':   self.translate_x,
+            'translate_y':   self.translate_y
         }
 
     @classmethod
     def from_dict(cls, params: Dict) -> 'AugmentationParams':
-        """Create from dictionary."""
         return cls(**params)
+
+    @classmethod
+    def identity(cls) -> 'AugmentationParams':
+        """Kembalikan params identity (no-op)."""
+        return cls()
 
 
 class InverseAugmentation(nn.Module):
     """
-    Inverse Augmentation module for DeepFusion.
+    Inverse Augmentation untuk DeepFusion.
 
-    This module reverses data augmentation transforms to maintain geometric
-    consistency between LiDAR and camera features during fusion.
-
-    The key insight: After augmentation, LiDAR points and image pixels are in
-    different coordinate systems. We need to reverse the augmentation on one
-    modality so both are aligned again.
+    Mendukung aug_params berupa:
+      - None                     → return as-is
+      - AugmentationParams       → satu params untuk seluruh batch
+      - list[AugmentationParams] → satu params per sample (diproses per-sample)
     """
 
     def __init__(self):
         super().__init__()
 
-    def inverse_rotation(
-        self,
-        features: torch.Tensor,
-        angle: float,
-        center_x: float,
-        center_y: float
-    ) -> torch.Tensor:
-        """
-        Apply inverse rotation to feature map.
+    # ── private helpers ───────────────────────────────────────────────────────
 
-        Args:
-            features: (B, C, H, W) feature map
-            angle: Rotation angle in radians
-            center_x: Center x coordinate
-            center_y: Center y coordinate
-
-        Returns:
-            Rotated feature map
-        """
+    def _inverse_rotation(self, feat: torch.Tensor, angle: float) -> torch.Tensor:
         if angle == 0.0:
-            return features
-
-        # Create inverse rotation transformation
-        cos_a = np.cos(-angle)  # Inverse rotation
-        sin_a = np.sin(-angle)
-
-        # Use grid sampling for rotation
-        theta = torch.tensor([
-            [cos_a, -sin_a, 0],
-            [sin_a, cos_a, 0]
-        ], dtype=features.dtype, device=features.device)
-
-        theta = theta.unsqueeze(0).repeat(features.shape[0], 1, 1)
-
-        # Create grid
+            return feat
+        cos_a = float(np.cos(-angle))
+        sin_a = float(np.sin(-angle))
+        theta = torch.tensor(
+            [[cos_a, -sin_a, 0.0],
+             [sin_a,  cos_a, 0.0]],
+            dtype=feat.dtype, device=feat.device
+        ).unsqueeze(0)                          # (1, 2, 3)
         grid = torch.nn.functional.affine_grid(
-            theta[:, :2, :],
-            features.size(),
-            align_corners=False
+            theta, feat.unsqueeze(0).size(), align_corners=False
         )
+        return torch.nn.functional.grid_sample(
+            feat.unsqueeze(0), grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False
+        ).squeeze(0)
 
-        # Sample
-        rotated = torch.nn.functional.grid_sample(
-            features,
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',  # MPS doesn't support 'border'
-            align_corners=False
-        )
-
-        return rotated
-
-    def inverse_flip(self, features: torch.Tensor, flip_x: bool, flip_y: bool) -> torch.Tensor:
-        """
-        Apply inverse flip to feature map.
-
-        Args:
-            features: (B, C, H, W) feature map
-            flip_x: Whether to flip along width dimension
-            flip_y: Whether to flip along height dimension
-
-        Returns:
-            Flipped feature map
-        """
-        if not flip_x and not flip_y:
-            return features
-
-        # Flip along width dimension (W)
+    def _inverse_flip(self, feat: torch.Tensor, flip_x: bool, flip_y: bool) -> torch.Tensor:
         if flip_x:
-            features = torch.flip(features, dims=[3])
-
-        # Flip along height dimension (H)
+            feat = torch.flip(feat, dims=[2])   # W dimension
         if flip_y:
-            features = torch.flip(features, dims=[2])
+            feat = torch.flip(feat, dims=[1])   # H dimension
+        return feat
 
-        return features
-
-    def inverse_scale(
-        self,
-        features: torch.Tensor,
-        scale: float
-    ) -> torch.Tensor:
-        """
-        Apply inverse scaling to feature map.
-
-        Args:
-            features: (B, C, H, W) feature map
-            scale: Scaling factor (value < 1 means zoom out, > 1 means zoom in)
-
-        Returns:
-            Scaled feature map
-        """
+    def _inverse_scale(self, feat: torch.Tensor, scale: float) -> torch.Tensor:
         if scale == 1.0:
-            return features
-
-        # Inverse scale
-        inv_scale = 1.0 / scale
-
-        # Calculate new size
-        _, _, H, W = features.shape
-        new_H = int(H * inv_scale)
-        new_W = int(W * inv_scale)
-
-        # Resize
+            return feat
+        C, H, W = feat.shape
+        inv = 1.0 / scale
         scaled = torch.nn.functional.interpolate(
-            features,
-            size=(new_H, new_W),
-            mode='bilinear',
-            align_corners=False
+            feat.unsqueeze(0),
+            size=(max(1, int(H * inv)), max(1, int(W * inv))),
+            mode='bilinear', align_corners=False
         )
+        # Resize kembali ke ukuran asli agar konsisten
+        return torch.nn.functional.interpolate(
+            scaled, size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(0)
 
-        # Resize back to original size if needed
-        if new_H != H or new_W != W:
-            scaled = torch.nn.functional.interpolate(
-                scaled,
-                size=(H, W),
-                mode='bilinear',
-                align_corners=False
-            )
+    def _apply_one(self, image_feat: torch.Tensor, p: AugmentationParams) -> torch.Tensor:
+        """
+        Terapkan inverse aug pada satu sampel image feature (C, H, W).
+        Urutan inverse: scale → flip → rotation (kebalikan dari augmentasi).
+        """
+        if p is None or p.is_identity():
+            return image_feat
 
-        return scaled
+        feat = image_feat
+        if p.scale != 1.0:
+            feat = self._inverse_scale(feat, p.scale)
+        if p.flip_x or p.flip_y:
+            feat = self._inverse_flip(feat, p.flip_x, p.flip_y)
+        if p.rotation_angle != 0.0:
+            feat = self._inverse_rotation(feat, p.rotation_angle)
+        return feat
+
+    # ── public forward ────────────────────────────────────────────────────────
 
     def forward(
         self,
         lidar_features: torch.Tensor,
         image_features: torch.Tensor,
-        aug_params: Optional[AugmentationParams] = None
+        aug_params: Optional[Union[
+            'AugmentationParams',
+            List[Optional['AugmentationParams']]
+        ]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply inverse augmentation to align features.
-
         Args:
-            lidar_features: (B, C_lidar, H, W) LiDAR BEV features
-            image_features: (B, C_image, H, W) image features (projected to BEV)
-            aug_params: Augmentation parameters
+            lidar_features: (B, C, H, W)
+            image_features: (B, C, H, W)
+            aug_params:
+                None                          → no-op
+                AugmentationParams            → sama untuk semua sample
+                list[AugmentationParams|None] → per-sample (panjang = B)
 
         Returns:
-            aligned_lidar: Aligned LiDAR features
-            aligned_image: Aligned image features (inverse augmented)
+            aligned_lidar : (B, C, H, W)  — tidak berubah
+            aligned_image : (B, C, H, W)  — sudah di-inverse-aug
         """
+        # ── kasus None atau semua identity → cepat ───────────────────────────
         if aug_params is None:
-            # No augmentation, return as is
             return lidar_features, image_features
 
-        # We inverse augment the IMAGE features to match LiDAR's original coordinates
-        # (LiDAR features are already in the augmented coordinate system from the backbone)
-        aligned_image = image_features.clone()
+        # ── normalisasi ke list[B] ────────────────────────────────────────────
+        B = lidar_features.shape[0]
 
-        # Apply inverse transforms in reverse order
-        # Order: scale -> flip -> rotation (reverse of augmentation order)
+        if isinstance(aug_params, AugmentationParams):
+            # satu params → broadcast ke semua sample
+            params_list: List[Optional[AugmentationParams]] = [aug_params] * B
+        elif isinstance(aug_params, list):
+            # sudah list — pastikan panjangnya B
+            if len(aug_params) != B:
+                # kalau tidak cocok (mis. collate edge case), pakai identity
+                params_list = [None] * B
+            else:
+                params_list = aug_params
+        else:
+            # tipe tidak dikenal → no-op
+            return lidar_features, image_features
 
-        # 1. Inverse scale
-        if aug_params.scale != 1.0:
-            aligned_image = self.inverse_scale(aligned_image, aug_params.scale)
+        # Kalau semua None → shortcut
+        if all(p is None for p in params_list):
+            return lidar_features, image_features
 
-        # 2. Inverse flip
-        if aug_params.flip_x or aug_params.flip_y:
-            aligned_image = self.inverse_flip(aligned_image, aug_params.flip_x, aug_params.flip_y)
+        # ── proses per-sample ─────────────────────────────────────────────────
+        aligned_images = []
+        for i in range(B):
+            p = params_list[i]
+            aligned = self._apply_one(image_features[i], p)   # (C, H, W)
+            aligned_images.append(aligned)
 
-        # 3. Inverse rotation
-        if aug_params.rotation_angle != 0.0:
-            # Get center of feature map
-            _, _, H, W = aligned_image.shape
-            center_x = W / 2.0
-            center_y = H / 2.0
-            aligned_image = self.inverse_rotation(aligned_image, aug_params.rotation_angle, center_x, center_y)
+        aligned_image_batch = torch.stack(aligned_images, dim=0)   # (B, C, H, W)
+        return lidar_features, aligned_image_batch
 
-        # LiDAR features remain as-is (already augmented)
-        aligned_lidar = lidar_features
-
-        return aligned_lidar, aligned_image
+    # ── point cloud helper (tidak berubah) ───────────────────────────────────
 
     def inverse_augment_point_cloud(
         self,
         points: torch.Tensor,
-        aug_params: AugmentationParams
+        aug_params: 'AugmentationParams'
     ) -> torch.Tensor:
-        """
-        Apply inverse augmentation directly to point cloud.
-
-        This is useful for coordinate transformations.
-
-        Args:
-            points: (N, 3+) point cloud [x, y, z, ...]
-            aug_params: Augmentation parameters
-
-        Returns:
-            Inverse augmented points
-        """
-        if aug_params is None:
+        if aug_params is None or aug_params.is_identity():
             return points
 
-        points_aug = points.clone()
+        pts = points.clone()
+        x, y = pts[:, 0], pts[:, 1]
 
-        # Extract x, y coordinates
-        x = points_aug[:, 0]
-        y = points_aug[:, 1]
-
-        # Inverse scale
         if aug_params.scale != 1.0:
             x = x / aug_params.scale
             y = y / aug_params.scale
 
-        # Inverse flip
         if aug_params.flip_x:
             x = -x
         if aug_params.flip_y:
             y = -y
 
-        # Inverse rotation
         if aug_params.rotation_angle != 0.0:
-            cos_a = np.cos(-aug_params.rotation_angle)
-            sin_a = np.sin(-aug_params.rotation_angle)
+            cos_a = float(np.cos(-aug_params.rotation_angle))
+            sin_a = float(np.sin(-aug_params.rotation_angle))
+            x, y = x * cos_a - y * sin_a, x * sin_a + y * cos_a
 
-            x_new = x * cos_a - y * sin_a
-            y_new = x * sin_a + y * cos_a
-
-            x = x_new
-            y = y_new
-
-        # Inverse translation
         if aug_params.translate_x != 0.0 or aug_params.translate_y != 0.0:
             x = x - aug_params.translate_x
             y = y - aug_params.translate_y
 
-        points_aug[:, 0] = x
-        points_aug[:, 1] = y
-
-        return points_aug
+        pts[:, 0], pts[:, 1] = x, y
+        return pts
 
 
 def get_inverse_augmentation_matrix(aug_params: AugmentationParams) -> np.ndarray:
-    """
-    Get the 3x3 inverse augmentation transformation matrix.
+    """Buat 3×3 inverse transformation matrix dari aug_params."""
+    M = np.eye(3)
+    M[0, 2] = -aug_params.translate_x
+    M[1, 2] = -aug_params.translate_y
 
-    Args:
-        aug_params: Augmentation parameters
-
-    Returns:
-        3x3 transformation matrix
-    """
-    # Start with identity
-    matrix = np.eye(3)
-
-    # Apply inverse translation
-    matrix[0, 2] = -aug_params.translate_x
-    matrix[1, 2] = -aug_params.translate_y
-
-    # Apply inverse scale
     if aug_params.scale != 1.0:
-        scale_matrix = np.eye(3)
-        inv_scale = 1.0 / aug_params.scale
-        scale_matrix[0, 0] = inv_scale
-        scale_matrix[1, 1] = inv_scale
-        matrix = scale_matrix @ matrix
+        s = np.diag([1.0 / aug_params.scale, 1.0 / aug_params.scale, 1.0])
+        M = s @ M
 
-    # Apply inverse flip
     if aug_params.flip_x or aug_params.flip_y:
-        flip_matrix = np.eye(3)
-        if aug_params.flip_x:
-            flip_matrix[0, 0] = -1
-        if aug_params.flip_y:
-            flip_matrix[1, 1] = -1
-        matrix = flip_matrix @ matrix
+        F = np.eye(3)
+        if aug_params.flip_x: F[0, 0] = -1
+        if aug_params.flip_y: F[1, 1] = -1
+        M = F @ M
 
-    # Apply inverse rotation
     if aug_params.rotation_angle != 0.0:
-        cos_a = np.cos(-aug_params.rotation_angle)
-        sin_a = np.sin(-aug_params.rotation_angle)
-        rotation_matrix = np.array([
-            [cos_a, -sin_a, 0],
-            [sin_a, cos_a, 0],
-            [0, 0, 1]
+        a = -aug_params.rotation_angle
+        R = np.array([
+            [np.cos(a), -np.sin(a), 0],
+            [np.sin(a),  np.cos(a), 0],
+            [0,          0,         1]
         ])
-        matrix = rotation_matrix @ matrix
+        M = R @ M
 
-    return matrix
-
-
-if __name__ == "__main__":
-    # Test the inverse augmentation module
-    batch_size = 2
-    channels = 64
-    height = 128
-    width = 128
-
-    # Create dummy features
-    lidar_features = torch.randn(batch_size, channels, height, width)
-    image_features = torch.randn(batch_size, channels, height, width)
-
-    # Create augmentation parameters
-    aug_params = AugmentationParams(
-        rotation_angle=np.pi / 6,  # 30 degrees
-        flip_x=True,
-        flip_y=False,
-        scale=0.95,
-        translate_x=0.1,
-        translate_y=0.1
-    )
-
-    # Create inverse augmentation module
-    inverse_aug = InverseAugmentation()
-
-    # Apply inverse augmentation
-    aligned_lidar, aligned_image = inverse_aug(lidar_features, image_features, aug_params)
-
-    print(f"LiDAR features shape: {lidar_features.shape}")
-    print(f"Aligned LiDAR features shape: {aligned_lidar.shape}")
-    print(f"Image features shape: {image_features.shape}")
-    print(f"Aligned image features shape: {aligned_image.shape}")
-
-    # Test point cloud inverse augmentation
-    num_points = 1000
-    points = torch.randn(num_points, 4)  # x, y, z, intensity
-
-    inverse_augmented_points = inverse_aug.inverse_augment_point_cloud(points, aug_params)
-
-    print(f"\nOriginal points shape: {points.shape}")
-    print(f"Inverse augmented points shape: {inverse_augmented_points.shape}")
-    print(f"Sample point difference: {(points[:5] - inverse_augmented_points[:5]).abs().sum()}")
+    return M
